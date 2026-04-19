@@ -1,0 +1,16 @@
+[package]
+name = "matching-engine"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "matching_engine"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["pyo3"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
+rand = "0.10.1"
