@@ -1,6 +1,6 @@
+use rand;
 use std::marker::PhantomData;
 use std::ptr;
-use rand;
 
 struct Node<K, V> {
     key: Option<K>,
@@ -57,13 +57,13 @@ impl<K: Ord, V> SkipList<K, V> {
             head: Node::new_sentinel(max_level),
             max_level,
             level: 0,
-            length: 0
+            length: 0,
         }
     }
 
     fn random_level(&mut self) -> usize {
         let mut lvl = 1;
-        while lvl < self.max_level && rand::random::<f64>()  < 0.5 {
+        while lvl < self.max_level && rand::random::<f64>() < 0.5 {
             lvl += 1;
         }
         lvl
@@ -336,94 +336,126 @@ impl<'a, K: Ord, V> Iterator for RangeIter<'a, K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::{fixture, rstest};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use std::collections::BTreeMap;
 
-    #[test]
-    fn insert_and_get() {
+    const ENTRIES: &[(Decimal, i32)] = &[
+        (dec!(5.0), 50),
+        (dec!(3.5), 30),
+        (dec!(8.25), 80),
+        (dec!(1.1), 10),
+        (dec!(4.0), 40),
+        (dec!(7.75), 70),
+        (dec!(2.5), 20),
+        (dec!(6.0), 60),
+        (dec!(9.9), 90),
+        (dec!(0.0), 0),
+    ];
+
+    #[fixture]
+    fn skiplist() -> SkipList<Decimal, i32> {
         let mut sl = SkipList::new(16);
-        sl.insert(3, "three");
-        sl.insert(1, "one");
-        sl.insert(2, "two");
-
-        assert_eq!(sl.get(&1), Some(&"one"));
-        assert_eq!(sl.get(&2), Some(&"two"));
-        assert_eq!(sl.get(&3), Some(&"three"));
-        assert_eq!(sl.get(&4), None);
-        assert_eq!(sl.len(), 3);
-    }
-
-    #[test]
-    fn insert_replaces() {
-        let mut sl = SkipList::new(16);
-        assert_eq!(sl.insert(1, "a"), None);
-        assert_eq!(sl.insert(1, "b"), Some("a"));
-        assert_eq!(sl.get(&1), Some(&"b"));
-        assert_eq!(sl.len(), 1);
-    }
-
-    #[test]
-    fn remove() {
-        let mut sl = SkipList::new(16);
-        sl.insert(1, "one");
-        sl.insert(2, "two");
-        sl.insert(3, "three");
-
-        assert_eq!(sl.remove(&2), Some("two"));
-        assert_eq!(sl.get(&2), None);
-        assert_eq!(sl.len(), 2);
-
-        assert_eq!(sl.remove(&2), None);
-        assert_eq!(sl.len(), 2);
-    }
-
-    #[test]
-    fn iteration_is_sorted() {
-        let mut sl = SkipList::new(16);
-        for &v in &[5, 3, 8, 1, 4, 7, 2, 6] {
-            sl.insert(v, v * 10);
+        for (k, v) in ENTRIES {
+            sl.insert(*k, *v);
         }
-        let keys: Vec<_> = sl.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        sl
     }
 
-    #[test]
-    fn range_query() {
-        let mut sl = SkipList::new(16);
-        for i in 0..10 {
-            sl.insert(i, i * 100);
-        }
-        let pairs: Vec<_> = sl.range(&3, &7).map(|(k, v)| (*k, *v)).collect();
-        assert_eq!(pairs, vec![(3, 300), (4, 400), (5, 500), (6, 600)]);
+    #[fixture]
+    fn btreemap() -> BTreeMap<Decimal, i32> {
+        ENTRIES.iter().copied().collect()
     }
 
-    #[test]
-    fn first_and_last() {
-        let mut sl = SkipList::new(16);
-        assert!(sl.first().is_none());
-        assert!(sl.last().is_none());
-
-        sl.insert(5, 'e');
-        sl.insert(2, 'b');
-        sl.insert(8, 'h');
-
-        assert_eq!(sl.first(), Some((&2, &'b')));
-        assert_eq!(sl.last(), Some((&8, &'h')));
+    #[rstest]
+    fn get_matches_btreemap(skiplist: SkipList<Decimal, i32>, btreemap: BTreeMap<Decimal, i32>) {
+        let probes = [
+            dec!(-1.0),
+            dec!(0.0),
+            dec!(1.1),
+            dec!(2.5),
+            dec!(3.5),
+            dec!(4.0),
+            dec!(5.0),
+            dec!(6.0),
+            dec!(7.75),
+            dec!(8.25),
+            dec!(9.9),
+            dec!(10.0),
+            dec!(3.499),
+        ];
+        for k in probes {
+            assert_eq!(skiplist.get(&k), btreemap.get(&k), "mismatch at key {k}");
+        }
+        assert_eq!(skiplist.len(), btreemap.len());
     }
 
-    #[test]
-    fn stress() {
-        let mut sl = SkipList::new(20);
-        for i in 0..1000 {
-            sl.insert(i, i);
+    #[rstest]
+    fn delete_key(mut skiplist: SkipList<Decimal, i32>, mut btreemap: BTreeMap<Decimal, i32>) {
+        let random_key = ENTRIES[rand::random_range(0..ENTRIES.len())].0;
+
+        skiplist.remove(&random_key);
+        btreemap.remove(&random_key);
+
+        for (k, _) in ENTRIES {
+            assert_eq!(skiplist.get(k), btreemap.get(k), "mismatch at key {k}");
         }
-        assert_eq!(sl.len(), 1000);
-        for i in 0..1000 {
-            assert_eq!(sl.get(&i), Some(&i));
-        }
-        for i in (0..1000).step_by(2) {
-            sl.remove(&i);
-        }
-        assert_eq!(sl.len(), 500);
-        let keys: Vec<_> = sl.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, (0..1000).skip(1).step_by(2).collect::<Vec<_>>());
+        assert_eq!(skiplist.len(), btreemap.len());
+    }
+
+    #[rstest]
+    fn get_first(skiplist: SkipList<Decimal, i32>, btreemap: BTreeMap<Decimal, i32>) {
+        let (sl_key, sl_val) = skiplist.first().unwrap();
+        let (bt_key, bt_val) = btreemap.first_key_value().unwrap();
+        assert_eq!(sl_key, bt_key);
+        assert_eq!(sl_val, bt_val);
+    }
+
+    #[rstest]
+    fn get_last(skiplist: SkipList<Decimal, i32>, btreemap: BTreeMap<Decimal, i32>) {
+        let (sl_key, sl_val) = skiplist.last().unwrap();
+        let (bt_key, bt_val) = btreemap.last_key_value().unwrap();
+
+        assert_eq!(sl_key, bt_key);
+        assert_eq!(sl_val, bt_val);
+    }
+
+    #[rstest]
+    fn contains(skiplist: SkipList<Decimal, i32>) {
+        assert_eq!(skiplist.contains(&dec!(5.0)), true);
+        assert_eq!(skiplist.contains(&dec!(-1.0)), false);
+    }
+
+    #[rstest]
+    fn empty(skiplist: SkipList<Decimal, i32>) {
+        let newskiplist: SkipList<Decimal, i32> = SkipList::new(1);
+        assert_eq!(skiplist.is_empty(), false);
+        assert_eq!(newskiplist.is_empty(), true);
+    }
+
+    #[rstest]
+    fn get_mut(mut skiplist: SkipList<Decimal, i32>) {
+        let ptn = skiplist.get_mut(&dec!(1.1)).unwrap();
+        *ptn = 100;
+        assert_eq!(skiplist.get(&dec!(1.1)).unwrap(), &100);
+    }
+
+    #[rstest]
+    #[case(dec!(3.0), dec!(7.0))]
+    #[case(dec!(0.0), dec!(10.0))]
+    #[case(dec!(-5.0), dec!(5.0))]
+    #[case(dec!(5.0), dec!(100.0))]
+    #[case(dec!(2.5), dec!(2.5))]
+    #[case(dec!(50.0), dec!(100.0))]
+    fn range_matches_btreemap(
+        skiplist: SkipList<Decimal, i32>,
+        btreemap: BTreeMap<Decimal, i32>,
+        #[case] from: Decimal,
+        #[case] to: Decimal,
+    ) {
+        let sl_range: Vec<_> = skiplist.range(&from, &to).map(|(k, v)| (*k, *v)).collect();
+        let bt_range: Vec<_> = btreemap.range(from..to).map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(sl_range, bt_range);
     }
 }

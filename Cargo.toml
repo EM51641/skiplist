@@ -14,3 +14,6 @@ python = ["pyo3"]
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 rand = "0.10.1"
+rstest = "0.26.1"
+rust_decimal = "1.42.0"
+rust_decimal_macros = "1.40.0"
