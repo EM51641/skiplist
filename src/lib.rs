@@ -1,2 +1,3 @@
-pub mod order_book;
+pub mod book;
+pub mod channel;
 pub mod skiplist;
