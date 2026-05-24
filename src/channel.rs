@@ -52,15 +52,6 @@ pub enum OrderAck {
 }
 
 #[derive(Clone)]
-pub struct Order<T> {
-    pub side: T,
-    pub price: Decimal,
-    pub qty: i32,
-    pub remaining: i32,
-    pub next: Option<Box<Order<T>>>,
-}
-
-#[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<Command>,
 }
