@@ -105,10 +105,21 @@ impl EngineHandle {
     }
 }
 
-fn spawn_book(side: Side) -> mpsc::Sender<Command> {
+fn pick<'a>(side: Side, bids: &'a mut Book, asks: &'a mut Book) -> &'a mut Book {
+    match side {
+        Side::Buy => bids,
+        Side::Sell => asks,
+    }
+}
+
+pub fn spawn_engine() -> EngineHandle {
     let (tx, mut rx) = mpsc::channel::<Command>(1024);
+
     tokio::spawn(async move {
-        let mut book = Book::new(side);
+        let mut bids = Book::new(Side::Buy, None, None, None);
+        let mut asks = Book::new(Side::Sell, None, None, None);
+        let mut side_of: HashMap<OrderId, Side> = HashMap::new();
+
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Command::NewOrder {
@@ -118,6 +129,8 @@ fn spawn_book(side: Side) -> mpsc::Sender<Command> {
                     qty,
                     reply,
                 } => {
+                    side_of.insert(order_id, side);
+                    let book = pick(side, &mut bids, &mut asks);
                     book.submit_order(NewOrder {
                         id: order_id,
                         side,
@@ -126,59 +139,14 @@ fn spawn_book(side: Side) -> mpsc::Sender<Command> {
                     });
                     let _ = reply.send(OrderAck::Accepted { order_id });
                 }
-                Command::CancelOrder { order_id, reply } => {
-                    book.cancel_order(CancelOrder { id: order_id });
-                    let _ = reply.send(OrderAck::Cancelled {
-                        order_id,
-                        reason: format!("{order_id} Cancelled"),
-                    });
-                }
-                Command::ModifyOrder {
-                    order_id,
-                    price,
-                    qty,
-                    reply,
-                } => {
-                    book.modify_order(ModifyOrder {
-                        id: order_id,
-                        new_qty: qty,
-                    });
-                    let _ = reply.send(OrderAck::Modified {
-                        order_id,
-                        price,
-                        qty,
-                    });
-                }
-            }
-        }
-    });
-    tx
-}
-
-pub fn spawn_engine() -> EngineHandle {
-    let (tx, mut rx) = mpsc::channel::<Command>(1024);
-    let bids_tx = spawn_book(Side::Buy);
-    let asks_tx = spawn_book(Side::Sell);
-
-    tokio::spawn(async move {
-        let mut side_of: HashMap<OrderId, Side> = HashMap::new();
-
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                Command::NewOrder { order_id, side, .. } => {
-                    side_of.insert(order_id, side);
-                    let target = match side {
-                        Side::Buy => &bids_tx,
-                        Side::Sell => &asks_tx,
-                    };
-                    let _ = target.send(cmd).await;
-                }
                 Command::CancelOrder { order_id, reply } => match side_of.remove(&order_id) {
-                    Some(Side::Buy) => {
-                        let _ = bids_tx.send(Command::CancelOrder { order_id, reply }).await;
-                    }
-                    Some(Side::Sell) => {
-                        let _ = asks_tx.send(Command::CancelOrder { order_id, reply }).await;
+                    Some(side) => {
+                        let book = pick(side, &mut bids, &mut asks);
+                        book.cancel_order(CancelOrder { id: order_id });
+                        let _ = reply.send(OrderAck::Cancelled {
+                            order_id,
+                            reason: format!("{order_id} Cancelled"),
+                        });
                     }
                     None => {
                         let _ = reply.send(OrderAck::Rejected {
@@ -191,26 +159,18 @@ pub fn spawn_engine() -> EngineHandle {
                     price,
                     qty,
                     reply,
-                } => match side_of.get(&order_id) {
-                    Some(Side::Buy) => {
-                        let _ = bids_tx
-                            .send(Command::ModifyOrder {
-                                order_id,
-                                price,
-                                qty,
-                                reply,
-                            })
-                            .await;
-                    }
-                    Some(Side::Sell) => {
-                        let _ = asks_tx
-                            .send(Command::ModifyOrder {
-                                order_id,
-                                price,
-                                qty,
-                                reply,
-                            })
-                            .await;
+                } => match side_of.get(&order_id).copied() {
+                    Some(side) => {
+                        let book = pick(side, &mut bids, &mut asks);
+                        book.modify_order(ModifyOrder {
+                            id: order_id,
+                            new_qty: qty,
+                        });
+                        let _ = reply.send(OrderAck::Modified {
+                            order_id,
+                            price,
+                            qty,
+                        });
                     }
                     None => {
                         let _ = reply.send(OrderAck::Rejected {

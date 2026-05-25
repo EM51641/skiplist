@@ -12,6 +12,7 @@ default = []
 python = ["pyo3"]
 
 [dependencies]
+fake = "5.1.0"
 pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 rand = "0.10.1"
 rstest = "0.26.1"
