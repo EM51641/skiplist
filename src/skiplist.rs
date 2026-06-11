@@ -183,7 +183,6 @@ impl<K: Ord, V> SkipList<K, V> {
         self.length == 0
     }
 
-    /// Smallest key-value pair (O(1)).
     pub fn first(&self) -> Option<(&K, &V)> {
         unsafe {
             let first = get_fwd(self.head, 0);

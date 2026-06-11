@@ -1,6 +1,6 @@
 use crate::skiplist::SkipList;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Neg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -230,8 +230,6 @@ impl Book {
         let qty_increased = req.new_qty > old_remaining;
 
         if price_changed || qty_increased {
-            // A reprice or a size increase forfeits time priority: remove the
-            // order and re-insert it at the tail of the (possibly new) level.
             self.cancel_order(CancelOrder { id: req.id });
             self.submit_order(NewOrder {
                 id: req.id,
@@ -240,7 +238,6 @@ impl Book {
                 qty: req.new_qty,
             });
         } else {
-            // Same price and a size decrease: adjust in place, keeping priority.
             self.slab.get_mut(nid).unwrap().remaining = req.new_qty;
             let k = self.key(old_price);
             if let Some(level) = self.levels.get_mut(&k) {
@@ -278,6 +275,87 @@ impl Book {
             side: self.side,
             levels,
         }
+    }
+
+    pub fn book_matcher(&mut self, target_price: &Decimal, mut target_qty: i32) -> bool {
+        let mut has_matched = false;
+        match self.side {
+            Side::Buy => {
+                while let Some((price, lvl)) = self.levels.first()
+                    && -price <= *target_price
+                    && target_qty > 0
+                {
+                    let price = *price;
+                    let head_id = lvl.head.expect("level must have a head");
+                    let (mut order_id, mut next_id, mut order_qty) = {
+                        let order = self.slab.get_mut(head_id).unwrap();
+                        (order.id, order.next, order.qty)
+                    };
+                    let level = self.levels.get_mut(&price).unwrap();
+
+                    while level.head.is_some() && target_qty > 0 {
+                        if order_qty > target_qty {
+                            order_qty -= target_qty;
+                            target_qty = 0;
+                        } else {
+                            target_qty -= order_qty;
+                            self.slab.remove(level.head.expect("Drop the head"));
+                            if let Some(id) = next_id {
+                                (order_id, next_id, order_qty) = {
+                                    let order = self.slab.get_mut(id).unwrap();
+                                    (order.id, order.next, order.qty)
+                                };
+                                level.head = Some(id);
+                            }
+                            self.order_index.remove(&order_id);
+                        }
+                    }
+
+                    if level.head.is_none() {
+                        self.levels.remove(&-price);
+                    }
+                    has_matched = true;
+                }
+            }
+            Side::Sell => {
+                while let Some((price, lvl)) = self.levels.first()
+                    && price <= target_price
+                    && target_qty > 0
+                {
+                    let price = *price;
+                    let head_id = lvl.head.expect("level must have a head");
+                    let (mut order_id, mut next_id, mut order_qty) = {
+                        let order = self.slab.get_mut(head_id).unwrap();
+                        (order.id, order.next, order.qty)
+                    };
+                    let level = self.levels.get_mut(&price).unwrap();
+
+                    while level.head.is_some() && target_qty > 0 {
+                        if order_qty > target_qty {
+                            order_qty -= target_qty;
+                            target_qty = 0;
+                        } else {
+                            target_qty -= order_qty;
+                            self.slab.remove(level.head.expect("Drop the head"));
+                            if let Some(id) = next_id {
+                                (order_id, next_id, order_qty) = {
+                                    let order = self.slab.get_mut(id).unwrap();
+                                    (order.id, order.next, order.qty)
+                                };
+                                level.head = Some(id);
+                            }
+                            self.order_index.remove(&order_id);
+                        }
+                    }
+
+                    if level.head.is_none() {
+                        self.levels.remove(&-price);
+                    }
+                    has_matched = true;
+                }
+            }
+        }
+        has_matched
     }
 }
 
@@ -724,7 +802,11 @@ mod tests {
 
             let level_10100 = &view.levels[1];
             assert_eq!(level_10100.price, px(10100));
-            assert_eq!(order_ids(level_10100), vec![3, 2], "order 2 joins at the tail");
+            assert_eq!(
+                order_ids(level_10100),
+                vec![3, 2],
+                "order 2 joins at the tail"
+            );
             assert_eq!(level_10100.total_qty, 50);
             assert_eq!(level_10100.orders[1].price, px(10100));
         }
