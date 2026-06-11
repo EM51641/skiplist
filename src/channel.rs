@@ -7,6 +7,13 @@ pub type OrderId = u64;
 pub type RejectReason = String;
 pub type CancelReason = String;
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineSnapshot {
+    pub bid_levels: Vec<(Decimal, i32)>,
+    pub ask_levels: Vec<(Decimal, i32)>,
+}
+
 pub enum Command {
     NewOrder {
         order_id: OrderId,
@@ -25,8 +32,14 @@ pub enum Command {
         qty: i32,
         reply: oneshot::Sender<OrderAck>,
     },
+
+    #[cfg(test)]
+    Snapshot {
+        reply: oneshot::Sender<EngineSnapshot>,
+    },
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum OrderAck {
     Accepted {
         order_id: OrderId,
@@ -103,6 +116,17 @@ impl EngineHandle {
 
         rx.await.expect("engine dropped before replying")
     }
+
+    #[cfg(test)]
+    pub async fn snapshot(&self) -> EngineSnapshot {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Snapshot { reply })
+            .await
+            .expect("engine dropped");
+
+        rx.await.expect("engine dropped before replying")
+    }
 }
 
 fn pick<'a>(side: Side, bids: &'a mut Book, asks: &'a mut Book) -> &'a mut Book {
@@ -164,6 +188,7 @@ pub fn spawn_engine() -> EngineHandle {
                         let book = pick(side, &mut bids, &mut asks);
                         book.modify_order(ModifyOrder {
                             id: order_id,
+                            new_price: price,
                             new_qty: qty,
                         });
                         let _ = reply.send(OrderAck::Modified {
@@ -178,9 +203,201 @@ pub fn spawn_engine() -> EngineHandle {
                         });
                     }
                 },
+                #[cfg(test)]
+                Command::Snapshot { reply } => {
+                    let snapshot = EngineSnapshot {
+                        bid_levels: bids
+                            .view()
+                            .levels
+                            .iter()
+                            .map(|l| (l.price, l.total_qty))
+                            .collect(),
+                        ask_levels: asks
+                            .view()
+                            .levels
+                            .iter()
+                            .map(|l| (l.price, l.total_qty))
+                            .collect(),
+                    };
+                    let _ = reply.send(snapshot);
+                }
             }
         }
     });
 
     EngineHandle { tx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn px(cents: i64) -> Decimal {
+        Decimal::new(cents, 2)
+    }
+
+    #[tokio::test]
+    async fn test_submit_order() {
+        let engine = spawn_engine();
+
+        let order_id = 1;
+        let side = Side::Buy;
+        let price = Decimal::new(100, 2);
+        let qty = 100;
+
+        let ack = engine.submit_order(side, order_id, price, qty).await;
+
+        assert_eq!(ack, OrderAck::Accepted { order_id });
+    }
+
+    #[tokio::test]
+    async fn new_order_appears_in_snapshot() {
+        let engine = spawn_engine();
+
+        assert_eq!(
+            engine.submit_order(Side::Buy, 1, px(10000), 100).await,
+            OrderAck::Accepted { order_id: 1 }
+        );
+        assert_eq!(
+            engine.submit_order(Side::Sell, 2, px(10100), 50).await,
+            OrderAck::Accepted { order_id: 2 }
+        );
+
+        let snapshot = engine.snapshot().await;
+
+        assert_eq!(
+            snapshot,
+            EngineSnapshot {
+                bid_levels: vec![(px(10000), 100)],
+                ask_levels: vec![(px(10100), 50)],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_order_disappears_from_snapshot() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Buy, 1, px(10000), 100).await;
+        engine.submit_order(Side::Buy, 2, px(10000), 40).await;
+
+        // Both rest on the same bid level before cancelling.
+        assert_eq!(
+            engine.snapshot().await,
+            EngineSnapshot {
+                bid_levels: vec![(px(10000), 140)],
+                ask_levels: vec![],
+            }
+        );
+
+        assert_eq!(
+            engine.cancel_order(1).await,
+            OrderAck::Cancelled {
+                order_id: 1,
+                reason: format!("{} Cancelled", 1),
+            }
+        );
+
+        // Only order 2's quantity remains on the level.
+        assert_eq!(
+            engine.snapshot().await,
+            EngineSnapshot {
+                bid_levels: vec![(px(10000), 40)],
+                ask_levels: vec![],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_order_leaves_snapshot_unchanged() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Sell, 1, px(10100), 50).await;
+
+        assert_eq!(
+            engine.cancel_order(999).await,
+            OrderAck::Rejected {
+                reason: format!("unknown order id:{}", 999),
+            }
+        );
+
+        assert_eq!(
+            engine.snapshot().await,
+            EngineSnapshot {
+                bid_levels: vec![],
+                ask_levels: vec![(px(10100), 50)],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_order_updates_snapshot_quantity() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Sell, 1, px(10100), 50).await;
+
+        assert_eq!(
+            engine.modify_order(1, px(10100), 20).await,
+            OrderAck::Modified {
+                order_id: 1,
+                price: px(10100),
+                qty: 20,
+            }
+        );
+
+        assert_eq!(
+            engine.snapshot().await,
+            EngineSnapshot {
+                bid_levels: vec![],
+                ask_levels: vec![(px(10100), 20)],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_order_reprices_in_snapshot() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Sell, 1, px(10100), 50).await;
+
+        // Repricing relocates the order to the new level.
+        assert_eq!(
+            engine.modify_order(1, px(10200), 50).await,
+            OrderAck::Modified {
+                order_id: 1,
+                price: px(10200),
+                qty: 50,
+            }
+        );
+
+        assert_eq!(
+            engine.snapshot().await,
+            EngineSnapshot {
+                bid_levels: vec![],
+                ask_levels: vec![(px(10200), 50)],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_unknown_order_leaves_snapshot_unchanged() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Buy, 1, px(10000), 100).await;
+
+        assert_eq!(
+            engine.modify_order(999, px(10000), 20).await,
+            OrderAck::Rejected {
+                reason: format!("unknown order id:{}", 999),
+            }
+        );
+
+        assert_eq!(
+            engine.snapshot().await,
+            EngineSnapshot {
+                bid_levels: vec![(px(10000), 100)],
+                ask_levels: vec![],
+            }
+        );
+    }
 }

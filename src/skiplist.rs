@@ -36,8 +36,6 @@ unsafe fn set_fwd<K, V>(node: *mut Node<K, V>, level: usize, target: *mut Node<K
     }
 }
 
-/// A probabilistic sorted data structure providing O(log n) average-case
-/// insert, search, and delete operations.
 pub struct SkipList<K: Ord, V> {
     head: *mut Node<K, V>,
     max_level: usize,
@@ -45,8 +43,6 @@ pub struct SkipList<K: Ord, V> {
     length: usize,
 }
 
-// SAFETY: SkipList owns all its nodes exclusively. Mutation requires &mut self,
-// so &SkipList can be safely shared (Sync) and moved (Send) across threads.
 unsafe impl<K: Ord + Send, V: Send> Send for SkipList<K, V> {}
 unsafe impl<K: Ord + Send + Sync, V: Send + Sync> Sync for SkipList<K, V> {}
 
@@ -137,7 +133,6 @@ impl<K: Ord, V> SkipList<K, V> {
         }
     }
 
-    /// Mutably look up a value by key.
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         unsafe {
             let (_, candidate) = self.find(key);
@@ -149,7 +144,6 @@ impl<K: Ord, V> SkipList<K, V> {
         }
     }
 
-    /// Remove a key and return its value.
     pub fn remove(&mut self, key: &K) -> Option<V> {
         unsafe {
             let (update, candidate) = self.find(key);
@@ -204,7 +198,6 @@ impl<K: Ord, V> SkipList<K, V> {
         }
     }
 
-    /// Largest key-value pair (O(log n) average via top-down descent).
     pub fn last(&self) -> Option<(&K, &V)> {
         unsafe {
             let mut current = self.head;
@@ -228,7 +221,6 @@ impl<K: Ord, V> SkipList<K, V> {
         }
     }
 
-    /// Iterate all entries in ascending key order.
     pub fn iter<'a>(&'a self) -> Iter<'a, K, V> {
         unsafe {
             Iter {
@@ -238,7 +230,6 @@ impl<K: Ord, V> SkipList<K, V> {
         }
     }
 
-    /// Iterate entries with keys in `[from, to)`.
     pub fn range<'a>(&'a self, from: &K, to: &'a K) -> RangeIter<'a, K, V> {
         unsafe {
             let mut current = self.head;
@@ -279,10 +270,6 @@ impl<K: Ord, V> Drop for SkipList<K, V> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Iterators
-// ---------------------------------------------------------------------------
 
 pub struct Iter<'a, K, V> {
     current: *mut Node<K, V>,
@@ -328,11 +315,6 @@ impl<'a, K: Ord, V> Iterator for RangeIter<'a, K, V> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;

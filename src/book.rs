@@ -24,6 +24,7 @@ pub struct CancelOrder {
 
 pub struct ModifyOrder {
     pub id: OrderId,
+    pub new_price: Decimal,
     pub new_qty: i32,
 }
 
@@ -98,6 +99,28 @@ pub struct Book {
     levels: SkipList<Decimal, Level>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BookView {
+    pub side: Side,
+    pub levels: Vec<PriceLevelView>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriceLevelView {
+    pub price: Decimal,
+    pub total_qty: i32,
+    pub orders: Vec<OrderView>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderView {
+    pub id: OrderId,
+    pub side: Side,
+    pub price: Decimal,
+    pub qty: i32,
+    pub remaining: i32,
+}
+
 impl Book {
     pub fn new(
         side: Side,
@@ -141,9 +164,6 @@ impl Book {
                 let prev_tail = level.tail;
                 level.tail = Some(nid);
                 level.total_qty += req.qty;
-                if level.head.is_none() {
-                    level.head = Some(nid);
-                }
                 if let Some(t) = prev_tail {
                     self.slab.get_mut(t).unwrap().next = Some(nid);
                     self.slab.get_mut(nid).unwrap().prev = Some(t);
@@ -199,18 +219,65 @@ impl Book {
         self.slab.remove(nid)
     }
 
-    pub fn modify_order(&mut self, req: ModifyOrder) -> Option<()> {
-        let nid = *self.order_index.get(&req.id)?;
-        let (price, old_remaining) = {
-            let n = self.slab.get(nid)?;
-            (n.price, n.remaining)
+    pub fn modify_order(&mut self, req: ModifyOrder) {
+        let nid = *self.order_index.get(&req.id).unwrap();
+        let (old_price, old_remaining, side) = {
+            let n = self.slab.get(nid).unwrap();
+            (n.price, n.remaining, n.side)
         };
-        self.slab.get_mut(nid)?.remaining = req.new_qty;
-        let k = self.key(price);
-        if let Some(level) = self.levels.get_mut(&k) {
-            level.total_qty += req.new_qty - old_remaining;
+
+        let price_changed = req.new_price != old_price;
+        let qty_increased = req.new_qty > old_remaining;
+
+        if price_changed || qty_increased {
+            // A reprice or a size increase forfeits time priority: remove the
+            // order and re-insert it at the tail of the (possibly new) level.
+            self.cancel_order(CancelOrder { id: req.id });
+            self.submit_order(NewOrder {
+                id: req.id,
+                side,
+                price: req.new_price,
+                qty: req.new_qty,
+            });
+        } else {
+            // Same price and a size decrease: adjust in place, keeping priority.
+            self.slab.get_mut(nid).unwrap().remaining = req.new_qty;
+            let k = self.key(old_price);
+            if let Some(level) = self.levels.get_mut(&k) {
+                level.total_qty += req.new_qty - old_remaining;
+            }
         }
-        Some(())
+    }
+
+    pub fn view(&self) -> BookView {
+        let mut levels = Vec::new();
+        for (key_price, level) in self.levels.iter() {
+            let mut orders = Vec::new();
+            let mut current = level.head;
+            while let Some(nid) = current {
+                let node = self.slab.get(nid).unwrap();
+                orders.push(OrderView {
+                    id: node.id,
+                    side: node.side,
+                    price: node.price,
+                    qty: node.qty,
+                    remaining: node.remaining,
+                });
+                current = node.next;
+            }
+            levels.push(PriceLevelView {
+                price: match self.side {
+                    Side::Buy => -*key_price,
+                    Side::Sell => *key_price,
+                },
+                total_qty: level.total_qty,
+                orders,
+            });
+        }
+        BookView {
+            side: self.side,
+            levels,
+        }
     }
 }
 
@@ -530,60 +597,513 @@ mod tests {
     mod modify {
         use super::*;
 
+        fn order_ids(level: &PriceLevelView) -> Vec<OrderId> {
+            level.orders.iter().map(|o| o.id).collect()
+        }
+
         #[test]
-        fn preserves_linkage_and_adjusts_level_total() {
+        fn qty_decrease_keeps_priority_in_place() {
             let side = Side::Sell;
             let price = px(10000);
 
-            let mut slab = Slab::new();
-            let nid_a = slab.insert(OrderNode {
+            let mut book = Book::new(side, None, None, None);
+            book.submit_order(NewOrder {
                 id: 1,
                 side,
                 price,
                 qty: 10,
-                remaining: 10,
-                prev: None,
-                next: None,
             });
-            let nid_b = slab.insert(OrderNode {
+            book.submit_order(NewOrder {
                 id: 2,
                 side,
                 price,
                 qty: 20,
-                remaining: 20,
-                prev: Some(nid_a),
-                next: None,
             });
-            slab.get_mut(nid_a).unwrap().next = Some(nid_b);
-
-            let mut order_index = HashMap::new();
-            order_index.insert(1, nid_a);
-            order_index.insert(2, nid_b);
-
-            let mut levels = SkipList::new(16);
-            levels.insert(
+            book.submit_order(NewOrder {
+                id: 3,
+                side,
                 price,
-                Level {
-                    head: Some(nid_a),
-                    tail: Some(nid_b),
-                    total_qty: 30,
-                },
-            );
+                qty: 30,
+            });
 
-            let mut book = Book::new(side, Some(levels), Some(slab), Some(order_index));
+            // Shrinking a resting order only helps the orders behind it, so it
+            // keeps its place in the queue.
+            book.modify_order(ModifyOrder {
+                id: 2,
+                new_price: price,
+                new_qty: 5,
+            });
 
-            assert!(
+            let view = book.view();
+            assert_eq!(view.levels.len(), 1);
+            let level = &view.levels[0];
+            assert_eq!(order_ids(level), vec![1, 2, 3], "order 2 stays in place");
+            assert_eq!(level.total_qty, 45);
+            assert_eq!(level.orders[1].remaining, 5);
+        }
+
+        #[test]
+        fn qty_increase_moves_to_tail() {
+            let side = Side::Sell;
+            let price = px(10000);
+
+            let mut book = Book::new(side, None, None, None);
+            book.submit_order(NewOrder {
+                id: 1,
+                side,
+                price,
+                qty: 10,
+            });
+            book.submit_order(NewOrder {
+                id: 2,
+                side,
+                price,
+                qty: 20,
+            });
+            book.submit_order(NewOrder {
+                id: 3,
+                side,
+                price,
+                qty: 30,
+            });
+
+            // Growing an order forfeits priority: it goes to the back of the level.
+            book.modify_order(ModifyOrder {
+                id: 2,
+                new_price: price,
+                new_qty: 50,
+            });
+
+            let view = book.view();
+            assert_eq!(view.levels.len(), 1);
+            let level = &view.levels[0];
+            assert_eq!(order_ids(level), vec![1, 3, 2], "order 2 moves to the tail");
+            assert_eq!(level.total_qty, 90);
+            assert_eq!(level.orders[2].remaining, 50);
+        }
+
+        #[test]
+        fn price_change_relocates_to_new_level_tail() {
+            let side = Side::Sell;
+
+            let mut book = Book::new(side, None, None, None);
+            book.submit_order(NewOrder {
+                id: 1,
+                side,
+                price: px(10000),
+                qty: 10,
+            });
+            book.submit_order(NewOrder {
+                id: 2,
+                side,
+                price: px(10000),
+                qty: 20,
+            });
+            book.submit_order(NewOrder {
+                id: 3,
+                side,
+                price: px(10100),
+                qty: 30,
+            });
+
+            // Repricing is a cancel-then-resubmit: order 2 leaves the 10000 level
+            // and joins the tail of the 10100 level.
+            book.modify_order(ModifyOrder {
+                id: 2,
+                new_price: px(10100),
+                new_qty: 20,
+            });
+
+            let view = book.view();
+            assert_eq!(view.levels.len(), 2);
+
+            let level_10000 = &view.levels[0];
+            assert_eq!(level_10000.price, px(10000));
+            assert_eq!(order_ids(level_10000), vec![1]);
+            assert_eq!(level_10000.total_qty, 10);
+
+            let level_10100 = &view.levels[1];
+            assert_eq!(level_10100.price, px(10100));
+            assert_eq!(order_ids(level_10100), vec![3, 2], "order 2 joins at the tail");
+            assert_eq!(level_10100.total_qty, 50);
+            assert_eq!(level_10100.orders[1].price, px(10100));
+        }
+    }
+
+    mod view {
+        use super::*;
+
+        mod ask {
+            use super::*;
+
+            #[test]
+            fn insert() {
+                let side = Side::Sell;
+
+                let mut book = Book::new(side, None, None, None);
+                // Submit out of price order to prove the view sorts ascending.
+                book.submit_order(NewOrder {
+                    id: 1,
+                    side,
+                    price: px(10100),
+                    qty: 20,
+                });
+                book.submit_order(NewOrder {
+                    id: 2,
+                    side,
+                    price: px(10000),
+                    qty: 10,
+                });
+                book.submit_order(NewOrder {
+                    id: 3,
+                    side,
+                    price: px(10000),
+                    qty: 30,
+                });
+
+                let view = book.view();
+
+                assert_eq!(
+                    view,
+                    BookView {
+                        side,
+                        levels: vec![
+                            PriceLevelView {
+                                price: px(10000),
+                                total_qty: 40,
+                                orders: vec![
+                                    OrderView {
+                                        id: 2,
+                                        side,
+                                        price: px(10000),
+                                        qty: 10,
+                                        remaining: 10,
+                                    },
+                                    OrderView {
+                                        id: 3,
+                                        side,
+                                        price: px(10000),
+                                        qty: 30,
+                                        remaining: 30,
+                                    },
+                                ],
+                            },
+                            PriceLevelView {
+                                price: px(10100),
+                                total_qty: 20,
+                                orders: vec![OrderView {
+                                    id: 1,
+                                    side,
+                                    price: px(10100),
+                                    qty: 20,
+                                    remaining: 20,
+                                }],
+                            },
+                        ],
+                    }
+                );
+            }
+
+            #[test]
+            fn delete() {
+                let side = Side::Sell;
+
+                let mut book = Book::new(side, None, None, None);
+                book.submit_order(NewOrder {
+                    id: 1,
+                    side,
+                    price: px(10000),
+                    qty: 10,
+                });
+                book.submit_order(NewOrder {
+                    id: 2,
+                    side,
+                    price: px(10000),
+                    qty: 20,
+                });
+                book.submit_order(NewOrder {
+                    id: 3,
+                    side,
+                    price: px(10100),
+                    qty: 30,
+                });
+
+                book.cancel_order(CancelOrder { id: 1 });
+
+                let view = book.view();
+
+                assert_eq!(
+                    view,
+                    BookView {
+                        side,
+                        levels: vec![
+                            PriceLevelView {
+                                price: px(10000),
+                                total_qty: 20,
+                                orders: vec![OrderView {
+                                    id: 2,
+                                    side,
+                                    price: px(10000),
+                                    qty: 20,
+                                    remaining: 20,
+                                }],
+                            },
+                            PriceLevelView {
+                                price: px(10100),
+                                total_qty: 30,
+                                orders: vec![OrderView {
+                                    id: 3,
+                                    side,
+                                    price: px(10100),
+                                    qty: 30,
+                                    remaining: 30,
+                                }],
+                            },
+                        ],
+                    }
+                );
+            }
+
+            #[test]
+            fn modify() {
+                let side = Side::Sell;
+
+                let mut book = Book::new(side, None, None, None);
+                book.submit_order(NewOrder {
+                    id: 1,
+                    side,
+                    price: px(10000),
+                    qty: 10,
+                });
+                book.submit_order(NewOrder {
+                    id: 2,
+                    side,
+                    price: px(10000),
+                    qty: 20,
+                });
+
                 book.modify_order(ModifyOrder {
                     id: 2,
-                    new_qty: 50
-                })
-                .is_some()
-            );
+                    new_price: px(10000),
+                    new_qty: 5,
+                });
 
-            let level = book.levels.get(&price).unwrap();
-            assert_eq!(level.head, Some(nid_a));
-            assert_eq!(level.tail, Some(nid_b));
-            assert_eq!(level.total_qty, 60);
+                let view = book.view();
+
+                assert_eq!(
+                    view,
+                    BookView {
+                        side,
+                        levels: vec![PriceLevelView {
+                            price: px(10000),
+                            total_qty: 15,
+                            orders: vec![
+                                OrderView {
+                                    id: 1,
+                                    side,
+                                    price: px(10000),
+                                    qty: 10,
+                                    remaining: 10,
+                                },
+                                OrderView {
+                                    id: 2,
+                                    side,
+                                    price: px(10000),
+                                    qty: 20,
+                                    remaining: 5,
+                                },
+                            ],
+                        }],
+                    }
+                );
+            }
+        }
+
+        mod bid {
+            use super::*;
+
+            #[test]
+            fn insert() {
+                let side = Side::Buy;
+
+                let mut book = Book::new(side, None, None, None);
+                // Submit out of price order to prove the view sorts descending.
+                book.submit_order(NewOrder {
+                    id: 1,
+                    side,
+                    price: px(9900),
+                    qty: 20,
+                });
+                book.submit_order(NewOrder {
+                    id: 2,
+                    side,
+                    price: px(10000),
+                    qty: 10,
+                });
+                book.submit_order(NewOrder {
+                    id: 3,
+                    side,
+                    price: px(10000),
+                    qty: 30,
+                });
+
+                let view = book.view();
+
+                // Best bid (highest price) first; prices reported as positive values.
+                assert_eq!(
+                    view,
+                    BookView {
+                        side,
+                        levels: vec![
+                            PriceLevelView {
+                                price: px(10000),
+                                total_qty: 40,
+                                orders: vec![
+                                    OrderView {
+                                        id: 2,
+                                        side,
+                                        price: px(10000),
+                                        qty: 10,
+                                        remaining: 10,
+                                    },
+                                    OrderView {
+                                        id: 3,
+                                        side,
+                                        price: px(10000),
+                                        qty: 30,
+                                        remaining: 30,
+                                    },
+                                ],
+                            },
+                            PriceLevelView {
+                                price: px(9900),
+                                total_qty: 20,
+                                orders: vec![OrderView {
+                                    id: 1,
+                                    side,
+                                    price: px(9900),
+                                    qty: 20,
+                                    remaining: 20,
+                                }],
+                            },
+                        ],
+                    }
+                );
+            }
+
+            #[test]
+            fn delete() {
+                let side = Side::Buy;
+
+                let mut book = Book::new(side, None, None, None);
+                book.submit_order(NewOrder {
+                    id: 1,
+                    side,
+                    price: px(10000),
+                    qty: 10,
+                });
+                book.submit_order(NewOrder {
+                    id: 2,
+                    side,
+                    price: px(10000),
+                    qty: 20,
+                });
+                book.submit_order(NewOrder {
+                    id: 3,
+                    side,
+                    price: px(9900),
+                    qty: 30,
+                });
+
+                book.cancel_order(CancelOrder { id: 1 });
+
+                let view = book.view();
+
+                assert_eq!(
+                    view,
+                    BookView {
+                        side,
+                        levels: vec![
+                            PriceLevelView {
+                                price: px(10000),
+                                total_qty: 20,
+                                orders: vec![OrderView {
+                                    id: 2,
+                                    side,
+                                    price: px(10000),
+                                    qty: 20,
+                                    remaining: 20,
+                                }],
+                            },
+                            PriceLevelView {
+                                price: px(9900),
+                                total_qty: 30,
+                                orders: vec![OrderView {
+                                    id: 3,
+                                    side,
+                                    price: px(9900),
+                                    qty: 30,
+                                    remaining: 30,
+                                }],
+                            },
+                        ],
+                    }
+                );
+            }
+
+            #[test]
+            fn modify() {
+                let side = Side::Buy;
+
+                let mut book = Book::new(side, None, None, None);
+                book.submit_order(NewOrder {
+                    id: 1,
+                    side,
+                    price: px(10000),
+                    qty: 10,
+                });
+                book.submit_order(NewOrder {
+                    id: 2,
+                    side,
+                    price: px(10000),
+                    qty: 20,
+                });
+
+                book.modify_order(ModifyOrder {
+                    id: 2,
+                    new_price: px(10000),
+                    new_qty: 5,
+                });
+
+                let view = book.view();
+
+                assert_eq!(
+                    view,
+                    BookView {
+                        side,
+                        levels: vec![PriceLevelView {
+                            price: px(10000),
+                            total_qty: 15,
+                            orders: vec![
+                                OrderView {
+                                    id: 1,
+                                    side,
+                                    price: px(10000),
+                                    qty: 10,
+                                    remaining: 10,
+                                },
+                                OrderView {
+                                    id: 2,
+                                    side,
+                                    price: px(10000),
+                                    qty: 20,
+                                    remaining: 5,
+                                },
+                            ],
+                        }],
+                    }
+                );
+            }
         }
     }
 }
