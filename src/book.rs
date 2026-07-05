@@ -1,6 +1,6 @@
 use crate::skiplist::SkipList;
 use rust_decimal::Decimal;
-use std::{collections::HashMap, ops::Neg};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -281,81 +281,69 @@ impl Book {
         let mut has_matched = false;
         match self.side {
             Side::Buy => {
-                while let Some((price, lvl)) = self.levels.first()
-                    && -price <= *target_price
+                // Incoming sell crosses bids priced at or above `target_price`,
+                // highest bid first (the front of the skiplist for a bid book).
+                while let Some((price, _)) = self.levels.first()
+                    && -price >= *target_price
                     && target_qty > 0
                 {
                     let price = *price;
-                    let head_id = lvl.head.expect("level must have a head");
-                    let (mut order_id, mut next_id, mut order_qty) = {
-                        let order = self.slab.get_mut(head_id).unwrap();
-                        (order.id, order.next, order.qty)
-                    };
-                    let level = self.levels.get_mut(&price).unwrap();
-
-                    while level.head.is_some() && target_qty > 0 {
-                        if order_qty > target_qty {
-                            order_qty -= target_qty;
-                            target_qty = 0;
-                        } else {
-                            target_qty -= order_qty;
-                            self.slab.remove(level.head.expect("Drop the head"));
-                            if let Some(id) = next_id {
-                                (order_id, next_id, order_qty) = {
-                                    let order = self.slab.get_mut(id).unwrap();
-                                    (order.id, order.next, order.qty)
-                                };
-                                level.head = Some(id);
-                            }
-                            self.order_index.remove(&order_id);
-                        }
-                    }
-
-                    if level.head.is_none() {
-                        self.levels.remove(&-price);
-                    }
+                    self.consume_level(price, &mut target_qty);
                     has_matched = true;
                 }
             }
             Side::Sell => {
-                while let Some((price, lvl)) = self.levels.first()
+                // Incoming buy crosses asks priced at or below `target_price`,
+                // lowest ask first (the front of the skiplist for an ask book).
+                while let Some((price, _)) = self.levels.first()
                     && price <= target_price
                     && target_qty > 0
                 {
                     let price = *price;
-                    let head_id = lvl.head.expect("level must have a head");
-                    let (mut order_id, mut next_id, mut order_qty) = {
-                        let order = self.slab.get_mut(head_id).unwrap();
-                        (order.id, order.next, order.qty)
-                    };
-                    let level = self.levels.get_mut(&price).unwrap();
-
-                    while level.head.is_some() && target_qty > 0 {
-                        if order_qty > target_qty {
-                            order_qty -= target_qty;
-                            target_qty = 0;
-                        } else {
-                            target_qty -= order_qty;
-                            self.slab.remove(level.head.expect("Drop the head"));
-                            if let Some(id) = next_id {
-                                (order_id, next_id, order_qty) = {
-                                    let order = self.slab.get_mut(id).unwrap();
-                                    (order.id, order.next, order.qty)
-                                };
-                                level.head = Some(id);
-                            }
-                            self.order_index.remove(&order_id);
-                        }
-                    }
-
-                    if level.head.is_none() {
-                        self.levels.remove(&-price);
-                    }
+                    self.consume_level(price, &mut target_qty);
                     has_matched = true;
                 }
             }
         }
         has_matched
+    }
+
+    /// Consume up to `target_qty` from the price level keyed by `price`, in
+    /// FIFO order. Fully-filled orders are removed from the slab, order index
+    /// and the level's list; a partial fill shrinks the head's `remaining`.
+    /// The level is dropped from the skiplist once it empties. `target_qty` is
+    /// decremented by the amount actually taken.
+    fn consume_level(&mut self, price: Decimal, target_qty: &mut i32) {
+        let level = self.levels.get_mut(&price).unwrap();
+
+        while *target_qty > 0 {
+            let Some(head_id) = level.head else { break };
+            let (order_id, next_id, remaining) = {
+                let order = self.slab.get(head_id).unwrap();
+                (order.id, order.next, order.remaining)
+            };
+
+            if remaining > *target_qty {
+                // Partial fill: the head stays resting with less quantity.
+                self.slab.get_mut(head_id).unwrap().remaining -= *target_qty;
+                level.total_qty -= *target_qty;
+                *target_qty = 0;
+            } else {
+                // Full fill: drop the head and advance to the next order.
+                *target_qty -= remaining;
+                level.total_qty -= remaining;
+                level.head = next_id;
+                if next_id.is_none() {
+                    level.tail = None;
+                }
+                self.slab.remove(head_id);
+                self.order_index.remove(&order_id);
+            }
+        }
+
+        if level.head.is_none() {
+            self.levels.remove(&price);
+        }
     }
 }
 
@@ -1009,7 +997,6 @@ mod tests {
                 let side = Side::Buy;
 
                 let mut book = Book::new(side, None, None, None);
-                // Submit out of price order to prove the view sorts descending.
                 book.submit_order(NewOrder {
                     id: 1,
                     side,
@@ -1185,6 +1172,187 @@ mod tests {
                         }],
                     }
                 );
+            }
+        }
+        mod book_matcher {
+            use super::*;
+            use rand::rngs::StdRng;
+            use rand::{RngExt, SeedableRng};
+            use std::collections::{BTreeMap, BTreeSet};
+
+            /// Surviving orders in the book as `id -> remaining`.
+            fn live_orders(book: &Book) -> BTreeMap<OrderId, i32> {
+                book.view()
+                    .levels
+                    .iter()
+                    .flat_map(|lvl| lvl.orders.iter().map(|o| (o.id, o.remaining)))
+                    .collect()
+            }
+
+            #[test]
+            fn bid_crosses_resting_ask_on_insert() {
+                // Ask book with one resting ask at 100.00.
+                let mut asks = Book::new(Side::Sell, None, None, None);
+                asks.submit_order(NewOrder {
+                    id: 1,
+                    side: Side::Sell,
+                    price: px(10000),
+                    qty: 10,
+                });
+
+                // Incoming bid at 101.00 crosses (bid >= ask) and fully fills it.
+                let matched = asks.book_matcher(&px(10100), 10);
+
+                assert!(matched);
+                assert!(live_orders(&asks).is_empty());
+            }
+
+            #[test]
+            fn bid_crosses_ask_after_modify() {
+                // Ask starts at 102.00 — too high for a 101.00 bid to reach.
+                let mut asks = Book::new(Side::Sell, None, None, None);
+                asks.submit_order(NewOrder {
+                    id: 1,
+                    side: Side::Sell,
+                    price: px(10200),
+                    qty: 10,
+                });
+                assert!(!asks.book_matcher(&px(10100), 10)); // no cross yet
+
+                // Reprice the ask down to 100.00 via a modify.
+                asks.modify_order(ModifyOrder {
+                    id: 1,
+                    new_price: px(10000),
+                    new_qty: 10,
+                });
+
+                // Now the 101.00 bid crosses and fully fills it.
+                let matched = asks.book_matcher(&px(10100), 10);
+
+                assert!(matched);
+                assert!(live_orders(&asks).is_empty());
+            }
+
+            /// Build a `resting_side` book of random orders that all cross an
+            /// incoming aggressor, optionally reworking each order with a
+            /// `modify` first, then match a random quantity and check the exact
+            /// leftovers. Expected leftovers are read from the book's own
+            /// price-time order (`view`) just before matching, so the same
+            /// helper works for bids/asks and for submit/modify alike.
+            fn crossing_case(resting_side: Side, apply_modify: bool, seed: u64) {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut book = Book::new(resting_side, None, None, None);
+                let mut ids = Vec::new();
+                let mut used = BTreeSet::new();
+
+                // Randomize the book's shape per seed: how many orders, the
+                // price band they live in, and the largest allowed quantity.
+                let n_orders = rng.random_range(1..=40);
+                let band_lo = rng.random_range(9000..=10000i64);
+                let band_hi = band_lo + rng.random_range(0..=1000i64);
+                let max_qty = rng.random_range(1..=200);
+
+                for _ in 0..n_orders {
+                    let id = loop {
+                        let candidate = rng.random_range(1..=1_000_000u64);
+                        if used.insert(candidate) {
+                            break candidate;
+                        }
+                    };
+                    let price = px(rng.random_range(band_lo..=band_hi));
+                    let qty = rng.random_range(1..=max_qty);
+                    book.submit_order(NewOrder { id, side: resting_side, price, qty });
+                    ids.push(id);
+                }
+
+                if apply_modify {
+                    for &id in &ids {
+                        let new_price = px(rng.random_range(band_lo..=band_hi));
+                        let new_qty = rng.random_range(1..=max_qty);
+                        book.modify_order(ModifyOrder { id, new_price, new_qty });
+                    }
+                }
+
+                // `view` already yields levels best-price-first and orders
+                // head->tail (FIFO) — i.e. exactly the matcher's consume order.
+                let snapshot = book.view();
+
+                // Aggressor priced from the book's own extremes so it crosses
+                // every order: a bid at the highest ask, or a sell at the lowest
+                // bid (the crossing check is inclusive).
+                let prices = snapshot.levels.iter().map(|lvl| lvl.price);
+                let target_price = match resting_side {
+                    Side::Sell => prices.max().unwrap(),
+                    Side::Buy => prices.min().unwrap(),
+                };
+                let total: i32 = snapshot
+                    .levels
+                    .iter()
+                    .flat_map(|lvl| lvl.orders.iter())
+                    .map(|o| o.remaining)
+                    .sum();
+                let target_qty = rng.random_range(1..=total);
+
+                let mut to_fill = target_qty;
+                let mut expected: BTreeMap<OrderId, i32> = BTreeMap::new();
+                for lvl in &snapshot.levels {
+                    let crosses = match resting_side {
+                        Side::Sell => lvl.price <= target_price,
+                        Side::Buy => lvl.price >= target_price,
+                    };
+                    for o in &lvl.orders {
+                        let left = if !crosses || to_fill == 0 {
+                            o.remaining
+                        } else if o.remaining > to_fill {
+                            let r = o.remaining - to_fill; // partial fill survives
+                            to_fill = 0;
+                            r
+                        } else {
+                            to_fill -= o.remaining; // fully consumed -> gone
+                            0
+                        };
+                        if left > 0 {
+                            expected.insert(o.id, left);
+                        }
+                    }
+                }
+
+                let matched = book.book_matcher(&target_price, target_qty);
+                assert!(matched);
+                assert_eq!(
+                    live_orders(&book),
+                    expected,
+                    "leftovers mismatch (side={resting_side:?}, modify={apply_modify}, \
+                     seed={seed}, qty={target_qty})"
+                );
+            }
+
+            #[test]
+            fn ask_book_crossed_on_submit() {
+                for seed in 0..50 {
+                    crossing_case(Side::Sell, false, seed);
+                }
+            }
+
+            #[test]
+            fn bid_book_crossed_on_submit() {
+                for seed in 0..50 {
+                    crossing_case(Side::Buy, false, seed);
+                }
+            }
+
+            #[test]
+            fn ask_book_crossed_after_modify() {
+                for seed in 0..50 {
+                    crossing_case(Side::Sell, true, seed);
+                }
+            }
+
+            #[test]
+            fn bid_book_crossed_after_modify() {
+                for seed in 0..50 {
+                    crossing_case(Side::Buy, true, seed);
+                }
             }
         }
     }
