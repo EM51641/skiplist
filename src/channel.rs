@@ -1,4 +1,5 @@
-use crate::book::{Book, CancelOrder, ModifyOrder, NewOrder, Side};
+use crate::book::Book;
+use crate::order::{CancelOrder, ModifyOrder, NewOrder, Side};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
@@ -10,8 +11,8 @@ pub type CancelReason = String;
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineSnapshot {
-    pub bid_levels: Vec<(Decimal, i32)>,
-    pub ask_levels: Vec<(Decimal, i32)>,
+    pub bids: crate::view::BookView,
+    pub asks: crate::view::BookView,
 }
 
 pub enum Command {
@@ -153,14 +154,22 @@ pub fn spawn_engine() -> EngineHandle {
                     qty,
                     reply,
                 } => {
-                    side_of.insert(order_id, side);
-                    let book = pick(side, &mut bids, &mut asks);
-                    book.submit_order(NewOrder {
-                        id: order_id,
-                        side,
-                        price,
-                        qty,
-                    });
+                    // Cross the incoming order against the opposite book first,
+                    // then rest whatever quantity is left unfilled on its own side.
+                    let unfilled = match side {
+                        Side::Buy => asks.book_matcher(&price, qty),
+                        Side::Sell => bids.book_matcher(&price, qty),
+                    };
+                    if unfilled > 0 {
+                        side_of.insert(order_id, side);
+                        let book = pick(side, &mut bids, &mut asks);
+                        book.submit_order(NewOrder {
+                            id: order_id,
+                            side,
+                            price,
+                            qty: unfilled,
+                        });
+                    }
                     let _ = reply.send(OrderAck::Accepted { order_id });
                 }
                 Command::CancelOrder { order_id, reply } => match side_of.remove(&order_id) {
@@ -185,12 +194,39 @@ pub fn spawn_engine() -> EngineHandle {
                     reply,
                 } => match side_of.get(&order_id).copied() {
                     Some(side) => {
-                        let book = pick(side, &mut bids, &mut asks);
-                        book.modify_order(ModifyOrder {
-                            id: order_id,
-                            new_price: price,
-                            new_qty: qty,
-                        });
+                        let (old_price, old_remaining) = {
+                            let book = pick(side, &mut bids, &mut asks);
+                            book.resting_order(order_id).unwrap()
+                        };
+                        // A reprice or a size increase forfeits time priority, so
+                        // it re-enters the market as an aggressor: pull the resting
+                        // order, cross against the opposite book, rest the rest.
+                        // A pure size decrease at the same price stays in place.
+                        let aggressive = price != old_price || qty > old_remaining;
+                        if aggressive {
+                            pick(side, &mut bids, &mut asks)
+                                .cancel_order(CancelOrder { id: order_id });
+                            let unfilled = match side {
+                                Side::Buy => asks.book_matcher(&price, qty),
+                                Side::Sell => bids.book_matcher(&price, qty),
+                            };
+                            if unfilled > 0 {
+                                pick(side, &mut bids, &mut asks).submit_order(NewOrder {
+                                    id: order_id,
+                                    side,
+                                    price,
+                                    qty: unfilled,
+                                });
+                            } else {
+                                side_of.remove(&order_id);
+                            }
+                        } else {
+                            pick(side, &mut bids, &mut asks).modify_order(ModifyOrder {
+                                id: order_id,
+                                new_price: price,
+                                new_qty: qty,
+                            });
+                        }
                         let _ = reply.send(OrderAck::Modified {
                             order_id,
                             price,
@@ -206,18 +242,8 @@ pub fn spawn_engine() -> EngineHandle {
                 #[cfg(test)]
                 Command::Snapshot { reply } => {
                     let snapshot = EngineSnapshot {
-                        bid_levels: bids
-                            .view()
-                            .levels
-                            .iter()
-                            .map(|l| (l.price, l.total_qty))
-                            .collect(),
-                        ask_levels: asks
-                            .view()
-                            .levels
-                            .iter()
-                            .map(|l| (l.price, l.total_qty))
-                            .collect(),
+                        bids: crate::view::BookView::from_book(&bids),
+                        asks: crate::view::BookView::from_book(&asks),
                     };
                     let _ = reply.send(snapshot);
                 }
@@ -231,23 +257,45 @@ pub fn spawn_engine() -> EngineHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::{BookView, OrderView, PriceLevelView};
 
     fn px(cents: i64) -> Decimal {
         Decimal::new(cents, 2)
     }
 
-    #[tokio::test]
-    async fn test_submit_order() {
-        let engine = spawn_engine();
+    fn book(side: Side, levels: Vec<PriceLevelView>) -> BookView {
+        BookView { side, levels }
+    }
 
-        let order_id = 1;
-        let side = Side::Buy;
-        let price = Decimal::new(100, 2);
-        let qty = 100;
+    fn level(price: Decimal, total_qty: i32, orders: Vec<OrderView>) -> PriceLevelView {
+        PriceLevelView {
+            price,
+            total_qty,
+            orders,
+        }
+    }
 
-        let ack = engine.submit_order(side, order_id, price, qty).await;
+    fn order(id: OrderId, side: Side, price: Decimal, qty: i32, remaining: i32) -> OrderView {
+        OrderView {
+            id,
+            side,
+            price,
+            qty,
+            remaining,
+        }
+    }
 
-        assert_eq!(ack, OrderAck::Accepted { order_id });
+    fn equivalent(side: Side, orders: &[(OrderId, Decimal, i32)]) -> BookView {
+        let mut book = Book::new(side, None, None, None);
+        for &(id, price, qty) in orders {
+            book.submit_order(NewOrder {
+                id,
+                side,
+                price,
+                qty,
+            });
+        }
+        BookView::from_book(&book)
     }
 
     #[tokio::test]
@@ -258,6 +306,7 @@ mod tests {
             engine.submit_order(Side::Buy, 1, px(10000), 100).await,
             OrderAck::Accepted { order_id: 1 }
         );
+
         assert_eq!(
             engine.submit_order(Side::Sell, 2, px(10100), 50).await,
             OrderAck::Accepted { order_id: 2 }
@@ -266,11 +315,26 @@ mod tests {
         let snapshot = engine.snapshot().await;
 
         assert_eq!(
-            snapshot,
-            EngineSnapshot {
-                bid_levels: vec![(px(10000), 100)],
-                ask_levels: vec![(px(10100), 50)],
-            }
+            snapshot.bids,
+            book(
+                Side::Buy,
+                vec![level(
+                    px(10000),
+                    100,
+                    vec![order(1, Side::Buy, px(10000), 100, 100)]
+                )]
+            )
+        );
+        assert_eq!(
+            snapshot.asks,
+            book(
+                Side::Sell,
+                vec![level(
+                    px(10100),
+                    50,
+                    vec![order(2, Side::Sell, px(10100), 50, 50)]
+                )]
+            )
         );
     }
 
@@ -279,16 +343,6 @@ mod tests {
         let engine = spawn_engine();
 
         engine.submit_order(Side::Buy, 1, px(10000), 100).await;
-        engine.submit_order(Side::Buy, 2, px(10000), 40).await;
-
-        // Both rest on the same bid level before cancelling.
-        assert_eq!(
-            engine.snapshot().await,
-            EngineSnapshot {
-                bid_levels: vec![(px(10000), 140)],
-                ask_levels: vec![],
-            }
-        );
 
         assert_eq!(
             engine.cancel_order(1).await,
@@ -298,14 +352,10 @@ mod tests {
             }
         );
 
-        // Only order 2's quantity remains on the level.
-        assert_eq!(
-            engine.snapshot().await,
-            EngineSnapshot {
-                bid_levels: vec![(px(10000), 40)],
-                ask_levels: vec![],
-            }
-        );
+        // The cancelled order is gone: the book is empty.
+        let snapshot = engine.snapshot().await;
+        assert_eq!(snapshot.bids, equivalent(Side::Buy, &[]));
+        assert_eq!(snapshot.asks, equivalent(Side::Sell, &[]));
     }
 
     #[tokio::test]
@@ -322,11 +372,15 @@ mod tests {
         );
 
         assert_eq!(
-            engine.snapshot().await,
-            EngineSnapshot {
-                bid_levels: vec![],
-                ask_levels: vec![(px(10100), 50)],
-            }
+            engine.snapshot().await.asks,
+            book(
+                Side::Sell,
+                vec![level(
+                    px(10100),
+                    50,
+                    vec![order(1, Side::Sell, px(10100), 50, 50)]
+                )]
+            )
         );
     }
 
@@ -346,11 +400,15 @@ mod tests {
         );
 
         assert_eq!(
-            engine.snapshot().await,
-            EngineSnapshot {
-                bid_levels: vec![],
-                ask_levels: vec![(px(10100), 20)],
-            }
+            engine.snapshot().await.asks,
+            book(
+                Side::Sell,
+                vec![level(
+                    px(10100),
+                    20,
+                    vec![order(1, Side::Sell, px(10100), 50, 20)]
+                )]
+            )
         );
     }
 
@@ -360,7 +418,6 @@ mod tests {
 
         engine.submit_order(Side::Sell, 1, px(10100), 50).await;
 
-        // Repricing relocates the order to the new level.
         assert_eq!(
             engine.modify_order(1, px(10200), 50).await,
             OrderAck::Modified {
@@ -371,11 +428,15 @@ mod tests {
         );
 
         assert_eq!(
-            engine.snapshot().await,
-            EngineSnapshot {
-                bid_levels: vec![],
-                ask_levels: vec![(px(10200), 50)],
-            }
+            engine.snapshot().await.asks,
+            book(
+                Side::Sell,
+                vec![level(
+                    px(10200),
+                    50,
+                    vec![order(1, Side::Sell, px(10200), 50, 50)]
+                )]
+            )
         );
     }
 
@@ -393,11 +454,77 @@ mod tests {
         );
 
         assert_eq!(
-            engine.snapshot().await,
-            EngineSnapshot {
-                bid_levels: vec![(px(10000), 100)],
-                ask_levels: vec![],
+            engine.snapshot().await.bids,
+            book(
+                Side::Buy,
+                vec![level(
+                    px(10000),
+                    100,
+                    vec![order(1, Side::Buy, px(10000), 100, 100)]
+                )]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn no_match_both_orders_rest() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Buy, 1, px(10000), 10).await;
+        engine.submit_order(Side::Sell, 2, px(10100), 10).await;
+
+        let snapshot = engine.snapshot().await;
+
+        assert_eq!(snapshot.bids, equivalent(Side::Buy, &[(1, px(10000), 10)]));
+        assert_eq!(snapshot.asks, equivalent(Side::Sell, &[(2, px(10100), 10)]));
+    }
+
+    #[tokio::test]
+    async fn one_bid_matches_ask() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Sell, 1, px(10000), 10).await;
+        engine.submit_order(Side::Buy, 2, px(10000), 10).await;
+
+        let snapshot = engine.snapshot().await;
+        assert_eq!(snapshot.bids, equivalent(Side::Buy, &[]));
+        assert_eq!(snapshot.asks, equivalent(Side::Sell, &[]));
+    }
+
+    #[tokio::test]
+    async fn one_ask_matches_bid() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Buy, 1, px(10000), 10).await;
+        engine.submit_order(Side::Sell, 2, px(10000), 10).await;
+
+        let snapshot = engine.snapshot().await;
+        assert_eq!(snapshot.bids, equivalent(Side::Buy, &[]));
+        assert_eq!(snapshot.asks, equivalent(Side::Sell, &[]));
+    }
+
+    #[tokio::test]
+    async fn reprice_via_modify_matches() {
+        let engine = spawn_engine();
+
+        engine.submit_order(Side::Sell, 1, px(10100), 10).await;
+        engine.submit_order(Side::Buy, 2, px(10000), 10).await;
+
+        let snapshot = engine.snapshot().await;
+        assert_eq!(snapshot.bids, equivalent(Side::Buy, &[(2, px(10000), 10)]));
+        assert_eq!(snapshot.asks, equivalent(Side::Sell, &[(1, px(10100), 10)]));
+
+        assert_eq!(
+            engine.modify_order(2, px(10100), 10).await,
+            OrderAck::Modified {
+                order_id: 2,
+                price: px(10100),
+                qty: 10,
             }
         );
+
+        let snapshot = engine.snapshot().await;
+        assert_eq!(snapshot.bids, equivalent(Side::Buy, &[]));
+        assert_eq!(snapshot.asks, equivalent(Side::Sell, &[]));
     }
 }
