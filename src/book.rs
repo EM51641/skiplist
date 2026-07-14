@@ -162,15 +162,9 @@ impl Book {
         }
     }
 
-    /// Match an incoming order of `target_qty` priced at `target_price` against
-    /// this (opposite-side) resting book, consuming crossing levels in
-    /// price-time priority. Returns the quantity left unfilled, which the caller
-    /// should rest on its own side of the book.
     pub fn book_matcher(&mut self, target_price: &Decimal, mut target_qty: i32) -> i32 {
         match self.side {
             Side::Buy => {
-                // Incoming sell crosses bids priced at or above `target_price`,
-                // highest bid first (the front of the skiplist for a bid book).
                 while let Some((price, _)) = self.levels.first()
                     && -price >= *target_price
                     && target_qty > 0
@@ -180,8 +174,6 @@ impl Book {
                 }
             }
             Side::Sell => {
-                // Incoming buy crosses asks priced at or below `target_price`,
-                // lowest ask first (the front of the skiplist for an ask book).
                 while let Some((price, _)) = self.levels.first()
                     && price <= target_price
                     && target_qty > 0
@@ -242,7 +234,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn into_empty_level_creates_isolated_node() {
+        fn ask_into_empty_level_creates_isolated_node() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -282,7 +274,7 @@ mod tests {
         }
 
         #[test]
-        fn appends_to_existing_level() {
+        fn ask_appends_to_existing_level() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -398,7 +390,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn only_order_removes_level() {
+        fn ask_only_order_removes_level() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -437,7 +429,7 @@ mod tests {
         }
 
         #[test]
-        fn head_relinks_and_updates_level() {
+        fn ask_head_relinks_and_updates_level() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -498,7 +490,7 @@ mod tests {
         }
 
         #[test]
-        fn tail_relinks_and_updates_level() {
+        fn ask_tail_relinks_and_updates_level() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -559,7 +551,7 @@ mod tests {
         }
 
         #[test]
-        fn middle_relinks_neighbors_and_updates_level() {
+        fn ask_middle_relinks_neighbors_and_updates_level() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -618,6 +610,230 @@ mod tests {
             assert_eq!(level.tail, Some(nid_c));
             assert_eq!(level.total_qty, 40);
         }
+
+        // The bid-side mirrors below repeat the same relink cases on a buy book,
+        // where the level is keyed by the negated price.
+        #[test]
+        fn bid_only_order_removes_level() {
+            let side = Side::Buy;
+            let price = px(10000);
+
+            let mut slab = Slab::new();
+            let nid = slab.insert(OrderNode {
+                id: 1,
+                side,
+                price,
+                qty: 10,
+                remaining: 10,
+                prev: None,
+                next: None,
+            });
+
+            let mut order_index = HashMap::new();
+            order_index.insert(1, nid);
+
+            let mut levels = SkipList::new(16);
+            levels.insert(
+                -price,
+                Level {
+                    head: Some(nid),
+                    tail: Some(nid),
+                    total_qty: 10,
+                },
+            );
+
+            let mut book = Book::new(side, Some(levels), Some(slab), Some(order_index));
+
+            let removed = book.cancel_order(CancelOrder { id: 1 });
+
+            assert!(removed.is_some());
+            assert_eq!(removed.unwrap().id, 1);
+            assert!(book.order_index.is_empty());
+            assert!(book.levels.get(&-price).is_none());
+        }
+
+        #[test]
+        fn bid_head_relinks_and_updates_level() {
+            let side = Side::Buy;
+            let price = px(10000);
+
+            let mut slab = Slab::new();
+            let nid_a = slab.insert(OrderNode {
+                id: 1,
+                side,
+                price,
+                qty: 10,
+                remaining: 10,
+                prev: None,
+                next: None,
+            });
+            let nid_b = slab.insert(OrderNode {
+                id: 2,
+                side,
+                price,
+                qty: 20,
+                remaining: 20,
+                prev: Some(nid_a),
+                next: None,
+            });
+            let nid_c = slab.insert(OrderNode {
+                id: 3,
+                side,
+                price,
+                qty: 30,
+                remaining: 30,
+                prev: Some(nid_b),
+                next: None,
+            });
+            slab.get_mut(nid_a).unwrap().next = Some(nid_b);
+            slab.get_mut(nid_b).unwrap().next = Some(nid_c);
+
+            let mut order_index = HashMap::new();
+            order_index.insert(1, nid_a);
+            order_index.insert(2, nid_b);
+            order_index.insert(3, nid_c);
+
+            let mut levels = SkipList::new(16);
+            levels.insert(
+                -price,
+                Level {
+                    head: Some(nid_a),
+                    tail: Some(nid_c),
+                    total_qty: 60,
+                },
+            );
+
+            let mut book = Book::new(side, Some(levels), Some(slab), Some(order_index));
+
+            book.cancel_order(CancelOrder { id: 1 });
+
+            let level = book.levels.get(&-price).unwrap();
+            assert_eq!(level.head, Some(nid_b));
+            assert_eq!(level.tail, Some(nid_c));
+            assert_eq!(level.total_qty, 50);
+        }
+
+        #[test]
+        fn bid_tail_relinks_and_updates_level() {
+            let side = Side::Buy;
+            let price = px(10000);
+
+            let mut slab = Slab::new();
+            let nid_a = slab.insert(OrderNode {
+                id: 1,
+                side,
+                price,
+                qty: 10,
+                remaining: 10,
+                prev: None,
+                next: None,
+            });
+            let nid_b = slab.insert(OrderNode {
+                id: 2,
+                side,
+                price,
+                qty: 20,
+                remaining: 20,
+                prev: Some(nid_a),
+                next: None,
+            });
+            let nid_c = slab.insert(OrderNode {
+                id: 3,
+                side,
+                price,
+                qty: 30,
+                remaining: 30,
+                prev: Some(nid_b),
+                next: None,
+            });
+            slab.get_mut(nid_a).unwrap().next = Some(nid_b);
+            slab.get_mut(nid_b).unwrap().next = Some(nid_c);
+
+            let mut order_index = HashMap::new();
+            order_index.insert(1, nid_a);
+            order_index.insert(2, nid_b);
+            order_index.insert(3, nid_c);
+
+            let mut levels = SkipList::new(16);
+            levels.insert(
+                -price,
+                Level {
+                    head: Some(nid_a),
+                    tail: Some(nid_c),
+                    total_qty: 60,
+                },
+            );
+
+            let mut book = Book::new(side, Some(levels), Some(slab), Some(order_index));
+
+            book.cancel_order(CancelOrder { id: 3 });
+
+            let level = book.levels.get(&-price).unwrap();
+            assert_eq!(level.head, Some(nid_a));
+            assert_eq!(level.tail, Some(nid_b));
+            assert_eq!(level.total_qty, 30);
+        }
+
+        #[test]
+        fn bid_middle_relinks_neighbors_and_updates_level() {
+            let side = Side::Buy;
+            let price = px(10000);
+
+            let mut slab = Slab::new();
+            let nid_a = slab.insert(OrderNode {
+                id: 1,
+                side,
+                price,
+                qty: 10,
+                remaining: 10,
+                prev: None,
+                next: None,
+            });
+            let nid_b = slab.insert(OrderNode {
+                id: 2,
+                side,
+                price,
+                qty: 20,
+                remaining: 20,
+                prev: Some(nid_a),
+                next: None,
+            });
+            let nid_c = slab.insert(OrderNode {
+                id: 3,
+                side,
+                price,
+                qty: 30,
+                remaining: 30,
+                prev: Some(nid_b),
+                next: None,
+            });
+            slab.get_mut(nid_a).unwrap().next = Some(nid_b);
+            slab.get_mut(nid_b).unwrap().next = Some(nid_c);
+
+            let mut order_index = HashMap::new();
+            order_index.insert(1, nid_a);
+            order_index.insert(2, nid_b);
+            order_index.insert(3, nid_c);
+
+            let mut levels = SkipList::new(16);
+            levels.insert(
+                -price,
+                Level {
+                    head: Some(nid_a),
+                    tail: Some(nid_c),
+                    total_qty: 60,
+                },
+            );
+
+            let mut book = Book::new(side, Some(levels), Some(slab), Some(order_index));
+
+            book.cancel_order(CancelOrder { id: 2 });
+
+            let level = book.levels.get(&-price).unwrap();
+            assert_eq!(level.head, Some(nid_a));
+            assert_eq!(level.tail, Some(nid_c));
+            assert_eq!(level.total_qty, 40);
+        }
     }
 
     mod modify {
@@ -628,7 +844,7 @@ mod tests {
         }
 
         #[test]
-        fn qty_decrease_keeps_priority_in_place() {
+        fn ask_qty_decrease_keeps_priority_in_place() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -667,7 +883,7 @@ mod tests {
         }
 
         #[test]
-        fn qty_increase_moves_to_tail() {
+        fn ask_qty_increase_moves_to_tail() {
             let side = Side::Sell;
             let price = px(10000);
 
@@ -706,7 +922,87 @@ mod tests {
         }
 
         #[test]
-        fn price_change_relocates_to_new_level_tail() {
+        fn bid_qty_decrease_keeps_priority_in_place() {
+            // Same in-place qty decrease on the buy side.
+            let side = Side::Buy;
+            let price = px(10000);
+
+            let mut book = Book::new(side, None, None, None);
+            book.submit_order(NewOrder {
+                id: 1,
+                side,
+                price,
+                qty: 10,
+            });
+            book.submit_order(NewOrder {
+                id: 2,
+                side,
+                price,
+                qty: 20,
+            });
+            book.submit_order(NewOrder {
+                id: 3,
+                side,
+                price,
+                qty: 30,
+            });
+
+            book.modify_order(ModifyOrder {
+                id: 2,
+                new_price: price,
+                new_qty: 5,
+            });
+
+            let view = BookView::from_book(&book);
+            assert_eq!(view.levels.len(), 1);
+            let level = &view.levels[0];
+            assert_eq!(order_ids(level), vec![1, 2, 3], "order 2 stays in place");
+            assert_eq!(level.total_qty, 45);
+            assert_eq!(level.orders[1].remaining, 5);
+        }
+
+        #[test]
+        fn bid_qty_increase_moves_to_tail() {
+            // Same qty increase / loss of priority on the buy side.
+            let side = Side::Buy;
+            let price = px(10000);
+
+            let mut book = Book::new(side, None, None, None);
+            book.submit_order(NewOrder {
+                id: 1,
+                side,
+                price,
+                qty: 10,
+            });
+            book.submit_order(NewOrder {
+                id: 2,
+                side,
+                price,
+                qty: 20,
+            });
+            book.submit_order(NewOrder {
+                id: 3,
+                side,
+                price,
+                qty: 30,
+            });
+
+            book.modify_order(ModifyOrder {
+                id: 2,
+                new_price: price,
+                new_qty: 50,
+            });
+
+            let view = BookView::from_book(&book);
+            assert_eq!(view.levels.len(), 1);
+            let level = &view.levels[0];
+            assert_eq!(order_ids(level), vec![1, 3, 2], "order 2 moves to the tail");
+            assert_eq!(level.total_qty, 90);
+            assert_eq!(level.orders[2].remaining, 50);
+        }
+
+        #[test]
+        fn ask_price_change_relocates_to_new_level_tail() {
             let side = Side::Sell;
 
             let mut book = Book::new(side, None, None, None);
@@ -803,6 +1099,136 @@ mod tests {
             );
             assert_eq!(level_9900.total_qty, 50);
             assert_eq!(level_9900.orders[1].price, px(9900));
+        }
+    }
+
+    mod matching {
+        use super::*;
+
+        fn submit(book: &mut Book, id: OrderId, price: Decimal, qty: i32) {
+            let side = book.side();
+            book.submit_order(NewOrder {
+                id,
+                side,
+                price,
+                qty,
+            });
+        }
+
+        fn order_ids(level: &PriceLevelView) -> Vec<OrderId> {
+            level.orders.iter().map(|o| o.id).collect()
+        }
+        #[test]
+        fn ask_partial_fill_stops_at_price_limit() {
+            let mut asks = Book::new(Side::Sell, None, None, None);
+            submit(&mut asks, 1, px(10000), 10);
+            submit(&mut asks, 2, px(10000), 7);
+            submit(&mut asks, 3, px(10100), 5);
+
+            // Incoming buy for 12 @ 10000: fully takes order 1 (10), partially
+            // takes order 2 (2 of 7). The 10100 level is above the limit.
+            let unfilled = asks.book_matcher(&px(10000), 12);
+            assert_eq!(unfilled, 0);
+
+            let view = BookView::from_book(&asks);
+            assert_eq!(view.levels.len(), 2);
+
+            let level_10000 = &view.levels[0];
+            assert_eq!(level_10000.price, px(10000));
+            assert_eq!(order_ids(level_10000), vec![2], "order 1 fully consumed");
+            assert_eq!(level_10000.total_qty, 5);
+            assert_eq!(
+                level_10000.orders[0].remaining, 5,
+                "order 2 partially filled"
+            );
+
+            let level_10100 = &view.levels[1];
+            assert_eq!(level_10100.price, px(10100));
+            assert_eq!(order_ids(level_10100), vec![3], "priced above the limit");
+            assert_eq!(level_10100.total_qty, 5);
+        }
+
+        #[test]
+        fn ask_sweeps_book_and_returns_unfilled() {
+            let mut asks = Book::new(Side::Sell, None, None, None);
+            submit(&mut asks, 1, px(10000), 10);
+            submit(&mut asks, 2, px(10000), 7);
+            submit(&mut asks, 3, px(10100), 5);
+
+            // Buy for 100 @ 10100: consumes all 22 resting, 78 left unfilled.
+            let unfilled = asks.book_matcher(&px(10100), 100);
+            assert_eq!(unfilled, 78);
+
+            let view = BookView::from_book(&asks);
+            assert!(view.levels.is_empty(), "book fully swept");
+        }
+
+        #[test]
+        fn ask_below_best_price_matches_nothing() {
+            let mut asks = Book::new(Side::Sell, None, None, None);
+            submit(&mut asks, 1, px(10000), 10);
+
+            let unfilled = asks.book_matcher(&px(9900), 100);
+            assert_eq!(unfilled, 100, "nothing filled");
+
+            let view = BookView::from_book(&asks);
+            assert_eq!(view.levels.len(), 1);
+            assert_eq!(view.levels[0].total_qty, 10, "book unchanged");
+        }
+
+        #[test]
+        fn bid_partial_fill_stops_at_price_limit() {
+            let mut bids = Book::new(Side::Buy, None, None, None);
+            submit(&mut bids, 1, px(10000), 10);
+            submit(&mut bids, 2, px(10000), 7);
+            submit(&mut bids, 3, px(9900), 5);
+
+            let unfilled = bids.book_matcher(&px(10000), 12);
+            assert_eq!(unfilled, 0);
+
+            let view = BookView::from_book(&bids);
+            assert_eq!(view.levels.len(), 2);
+
+            let level_10000 = &view.levels[0];
+            assert_eq!(level_10000.price, px(10000));
+            assert_eq!(order_ids(level_10000), vec![2], "order 1 fully consumed");
+            assert_eq!(level_10000.total_qty, 5);
+            assert_eq!(
+                level_10000.orders[0].remaining, 5,
+                "order 2 partially filled"
+            );
+
+            let level_9900 = &view.levels[1];
+            assert_eq!(level_9900.price, px(9900));
+            assert_eq!(order_ids(level_9900), vec![3], "priced below the limit");
+            assert_eq!(level_9900.total_qty, 5);
+        }
+
+        #[test]
+        fn bid_sweeps_book_and_returns_unfilled() {
+            let mut bids = Book::new(Side::Buy, None, None, None);
+            submit(&mut bids, 1, px(10000), 10);
+            submit(&mut bids, 2, px(10000), 7);
+            submit(&mut bids, 3, px(9900), 5);
+
+            let unfilled = bids.book_matcher(&px(9900), 100);
+            assert_eq!(unfilled, 78);
+
+            let view = BookView::from_book(&bids);
+            assert!(view.levels.is_empty(), "book fully swept");
+        }
+
+        #[test]
+        fn bid_above_best_price_matches_nothing() {
+            let mut bids = Book::new(Side::Buy, None, None, None);
+            submit(&mut bids, 1, px(10000), 10);
+
+            let unfilled = bids.book_matcher(&px(10100), 100);
+            assert_eq!(unfilled, 100, "nothing filled");
+
+            let view = BookView::from_book(&bids);
+            assert_eq!(view.levels.len(), 1);
+            assert_eq!(view.levels[0].total_qty, 10, "book unchanged");
         }
     }
 }
